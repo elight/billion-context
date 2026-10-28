@@ -264,10 +264,39 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
     };
 }
 
+// #5032: the declared context window of the session's CURRENT model, recorded
+// on every chat.headers event. The shared oversize arm in directSendOrRefuse
+// (native-intercept.ts) prefers the stamped x-bili-plugin-context-window header
+// — but this lane stamps that header only when a live proxy base resolves (see
+// the chat.headers handler below), so a request that finds NO live proxy
+// carried none and the arm stayed disarmed in exactly the degraded direct-send
+// state (#4894 armed dsh; #5025 armed pi). Recorded BEFORE the readiness return
+// for the same reason. `undefined` means UNKNOWN (no model info / model absent
+// from the config window table) and the arm then fails open rather than
+// guessing a window for this request.
+let opencodeDeclaredWindow: number | undefined;
+
+/** #5032: window reader the native intercept arms as declaredWindowForDirect.
+ *  Process-scoped: V1 opencode dispatches model requests sequentially per
+ *  session (subagents ride their own sessions, same value per model). */
+export function opencodeDeclaredWindowForDirect(): number | undefined {
+    return opencodeDeclaredWindow;
+}
+
+/** Test hook: forget the recorded window (fixtures share one process). */
+export function _resetOpencodeDeclaredWindowForTest(): void {
+    opencodeDeclaredWindow = undefined;
+}
+
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
 // #3304: the opencode swap stamps the turn id atomically with the body, so the
 // strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
 state.prepareDirectSend = createPrepareDirectSend();
+// #5032: arm the shared oversize arm for the degraded direct path. Without it
+// the guard failed open by construction and an oversized unfurled history rode
+// straight to the provider, whose "input exceeds the context window" 400
+// repeats on every retry while the proxy stays down.
+state.declaredWindowForDirect = opencodeDeclaredWindowForDirect;
 
 async function bootstrap(): Promise<string | undefined> {
     try {
@@ -462,6 +491,11 @@ export function _stateRespawnForTest(): (() => Promise<string | undefined>) | un
 /** Test hook (#1365): record routed-channel evidence without the fetch patch. */
 export function _noteRoutedForTest(url: string): void {
     noteRoutedOrigin(state, url);
+}
+
+/** Test hook (#5032): the armed direct-send window reader, if any. */
+export function _declaredWindowHookForTest(): (() => number | undefined) | undefined {
+    return state.declaredWindowForDirect;
 }
 
 /** Test hook: reset the module-level state in place (closures capture the
@@ -810,6 +844,17 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                 output.headers["x-bili-plugin-bypass"] = "1";
                 return;
             }
+            // #5032: record this request's declared window FIRST — the
+            // proxy-readiness return right below is precisely the degraded
+            // direct-send path the shared oversize arm measures against, so
+            // the window must not depend on the proxy being up. Unknown model
+            // / model absent from the config table records undefined → fail
+            // open, never a guessed window (windows values are already floored
+            // by extractV1Windows).
+            const declaredModel = input.model;
+            opencodeDeclaredWindow = declaredModel !== undefined && typeof declaredModel.providerID === "string" && typeof declaredModel.id === "string"
+                ? windows.get(`${declaredModel.providerID}/${declaredModel.id}`)
+                : undefined;
             const base = getOrigin();
             // No live proxy: traffic goes direct — stamping would leak the
             // conversation id to a raw upstream and mark plugin mode for a
